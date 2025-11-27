@@ -1,0 +1,985 @@
+# services/data_facade.py
+"""
+DataService － 資料存取統一入口（Facade）
+封裝 SpeakerRepo、VoiceprintRepo… 提供 API 層存取。
+
+此模組包含所有與語者管理相關的業務邏輯，
+將 HTTP 層與業務邏輯分離，提高程式碼的可維護性和可測試性。
+"""
+from typing import Dict, Any, Optional, List
+from fastapi import HTTPException
+from modules.management.VID_manager import SpeakerManager, SessionManager, SpeechLogManager
+from modules.identification.VID_identify_v5 import AudioProcessor
+from modules.database.database import DatabaseService
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+class DataFacade:
+    """資料庫管理的邏輯處理器"""
+    
+    def __init__(self) -> None:
+        """初始化各種處理器"""
+        # 各個獨立的管理器
+        self.speaker_manager = SpeakerManager()
+        self.session_manager = SessionManager()  
+        self.speechlog_manager = SpeechLogManager()
+        
+        # 初始化語音處理器和資料庫服務（用於純讀取的語音驗證）
+        self.audio_processor = AudioProcessor()
+        self.database = DatabaseService()
+    
+    def rename_speaker(
+        self, 
+        speaker_id: str, 
+        current_name: str, 
+        new_name: str
+    ) -> Dict[str, Any]:
+        """
+        更改語者名稱的業務邏輯
+        
+        Args:
+            speaker_id: 語者的唯一識別碼
+            current_name: 當前語者名稱
+            new_name: 新的語者名稱
+            
+        Returns:
+            Dict[str, Any]: 包含操作結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 驗證輸入參數
+            if not speaker_id.strip():
+                raise HTTPException(status_code=400, detail="語者ID不能為空")
+            
+            if not new_name.strip():
+                raise HTTPException(status_code=400, detail="新名稱不能為空")
+            
+            # 2. 檢查語者是否存在
+            obj = self.speaker_manager.get_speaker(speaker_id)
+            if not obj:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"找不到ID為 {speaker_id} 的語者"
+                )
+            
+            # 3. 驗證當前名稱是否匹配（安全檢查）
+            current_speaker_name = obj.properties.get('full_name', '')  # V2: 使用 full_name
+            if current_name.strip() != current_speaker_name:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"提供的當前名稱 '{current_name}' 與資料庫中的名稱 '{current_speaker_name}' 不符"
+                )
+            
+            # 4. 執行改名操作
+            success = self.speaker_manager.update_speaker_name(
+                speaker_id, 
+                new_name.strip()
+            )
+            
+            if success:
+                logger.info(f"成功將語者 {speaker_id} 從 '{current_name}' 更名為 '{new_name}'")
+                return {
+                    "success": True,
+                    "message": f"成功將語者 '{current_name}' 更名為 '{new_name}'",
+                    "data": {
+                        "speaker_id": speaker_id,
+                        "old_name": current_name,
+                        "new_name": new_name.strip()
+                    }
+                }
+            else:
+                logger.error(f"更名操作失敗：speaker_id={speaker_id}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="更名操作失敗，請檢查日誌以獲取詳細資訊"
+                )
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"更名操作發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def transfer_voiceprints(
+        self,
+        source_speaker_id: str,
+        source_speaker_name: str,
+        target_speaker_id: str,
+        target_speaker_name: str
+    ) -> Dict[str, Any]:
+        """
+        將聲紋從來源語者轉移到目標語者的業務邏輯
+        
+        Args:
+            source_speaker_id: 來源語者ID
+            source_speaker_name: 來源語者名稱
+            target_speaker_id: 目標語者ID
+            target_speaker_name: 目標語者名稱
+            
+        Returns:
+            Dict[str, Any]: 包含操作結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 驗證輸入參數
+            if not source_speaker_id.strip():
+                raise HTTPException(status_code=400, detail="來源語者ID不能為空")
+            
+            if not target_speaker_id.strip():
+                raise HTTPException(status_code=400, detail="目標語者ID不能為空")
+            
+            if source_speaker_id == target_speaker_id:
+                raise HTTPException(status_code=400, detail="來源語者和目標語者不能是同一人")
+            
+            # 2. 檢查來源語者是否存在
+            source_speaker = self.speaker_manager.get_speaker(source_speaker_id)
+            if not source_speaker:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"找不到ID為 {source_speaker_id} 的來源語者"
+                )
+            
+            # 3. 檢查目標語者是否存在
+            target_speaker = self.speaker_manager.get_speaker(target_speaker_id)
+            if not target_speaker:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"找不到ID為 {target_speaker_id} 的目標語者"
+                )
+            
+            # 4. 驗證語者名稱是否匹配（安全檢查）
+            source_name = source_speaker.properties.get('full_name', '')  # V2: 使用 full_name
+            target_name = target_speaker.properties.get('full_name', '')  # V2: 使用 full_name
+            
+            if source_speaker_name.strip() != source_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"提供的來源語者名稱 '{source_speaker_name}' 與資料庫中的名稱 '{source_name}' 不符"
+                )
+            
+            if target_speaker_name.strip() != target_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"提供的目標語者名稱 '{target_speaker_name}' 與資料庫中的名稱 '{target_name}' 不符"
+                )
+            
+            # 5. 執行聲紋轉移操作（轉移所有聲紋）
+            success = self.speaker_manager.transfer_voiceprints(
+                source_uuid=source_speaker_id,
+                dest_uuid=target_speaker_id,
+                voiceprint_ids=None  # None 表示轉移所有聲紋
+            )
+            
+            if success:
+                logger.info(f"成功轉移聲紋：{source_speaker_id} -> {target_speaker_id}")
+                return {
+                    "success": True,
+                    "message": f"成功將語者 '{source_speaker_name}' 的所有聲紋轉移到 '{target_speaker_name}' 並刪除來源語者",
+                    "data": {
+                        "source_speaker_id": source_speaker_id,
+                        "source_speaker_name": source_speaker_name,
+                        "target_speaker_id": target_speaker_id,
+                        "target_speaker_name": target_speaker_name
+                    }
+                }
+            else:
+                logger.error(f"聲紋轉移失敗：{source_speaker_id} -> {target_speaker_id}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="聲紋轉移操作失敗，請檢查日誌以獲取詳細資訊"
+                )
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"聲紋轉移發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def get_speaker_info(self, speaker_id: str) -> Dict[str, Any]:
+        """
+        獲取語者資訊 - 回傳 V2 資料庫完整結構
+        支援UUID和序號ID兩種查詢方式
+        
+        Args:
+            speaker_id: 語者ID，可以是UUID或序號ID
+            
+        Returns:
+            Dict[str, Any]: V2 資料庫完整語者資訊
+            
+        Raises:
+            HTTPException: 當語者不存在時
+        """
+        try:
+            obj = None
+            
+            # 嘗試判斷是 UUID 還是序號ID
+            if speaker_id.isdigit():
+                # 如果是純數字，當作序號ID處理
+                numeric_id = int(speaker_id)
+                obj = self.database.get_speaker_by_id(numeric_id)
+            else:
+                # 否則當作UUID處理
+                obj = self.speaker_manager.get_speaker(speaker_id)
+                
+            if not obj:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"找不到ID為 {speaker_id} 的語者"
+                )
+            
+            props = obj.properties
+
+            # 處理時間欄位，確保轉換為字串格式
+            created_at = props.get('created_at')
+            last_active_at = props.get('last_active_at')
+            
+            # 如果是 datetime 對象，轉換為 ISO 格式字串
+            if hasattr(created_at, 'isoformat'):
+                created_at = created_at.isoformat()
+            elif created_at is None:
+                created_at = None  # 保持 None
+                
+            if hasattr(last_active_at, 'isoformat'):
+                last_active_at = last_active_at.isoformat()
+            elif last_active_at is None:
+                last_active_at = None  # 保持 None
+
+            # 回傳 V2 資料庫的所有屬性，保持原始值（包括 None）
+            return {
+                "uuid": str(obj.uuid),  # Weaviate UUID
+                "speaker_id": props.get('speaker_id', -1),  # 序號ID
+                "full_name": props.get('full_name'),  # 可能是 None
+                "nickname": props.get('nickname'),  # 可能是 None
+                "gender": props.get('gender'),  # 可能是 None
+                "created_at": created_at,  # 轉換後的時間字串或None
+                "last_active_at": last_active_at,  # 轉換後的時間字串或None
+                "meet_count": props.get('meet_count'),  # 可能是 None
+                "meet_days": props.get('meet_days'),  # 可能是 None
+                "voiceprint_ids": [str(vid) for vid in props.get('voiceprint_ids', [])],  # UUID 陣列轉字串陣列
+                "first_audio": props.get('first_audio')  # 可能是 None
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"獲取語者資訊發生錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+
+    def list_all_speakers(self) -> List[Dict[str, Any]]:
+        """
+        列出所有語者的業務邏輯 - 回傳 V2 資料庫完整結構
+        
+        Returns:
+            List[Dict[str, Any]]: V2 資料庫完整語者列表
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 從資料庫服務獲取所有語者（V2版本）
+            speakers = self.database.list_all_speakers()
+            
+            # 2. 轉換為 V2 API 回應格式（保留原始值，包括 None）
+            api_speakers = []
+            for speaker in speakers:
+                # 轉換 UUID 物件為字串
+                speaker_id = str(speaker["uuid"])
+                voiceprint_ids = speaker.get("voiceprint_ids", [])
+                voiceprint_ids_str = [str(vp_id) for vp_id in voiceprint_ids] if voiceprint_ids else []
+                
+                # 處理時間欄位，確保轉換為字串格式
+                created_at = speaker.get('created_at')
+                last_active_at = speaker.get('last_active_at')
+                
+                # 如果是 datetime 對象，轉換為 ISO 格式字串
+                if hasattr(created_at, 'isoformat'):
+                    created_at = created_at.isoformat()
+                elif created_at is None:
+                    created_at = None  # 保持 None
+                    
+                if hasattr(last_active_at, 'isoformat'):
+                    last_active_at = last_active_at.isoformat()
+                elif last_active_at is None:
+                    last_active_at = None  # 保持 None
+                
+                # V2 資料庫完整屬性，保持原始值
+                api_speaker = {
+                    "uuid": speaker_id,  # Weaviate UUID 
+                    "speaker_id": speaker.get("speaker_id", -1),  # 序號ID
+                    "full_name": speaker.get("full_name"),  # 可能是 None
+                    "nickname": speaker.get("nickname"),  # 可能是 None  
+                    "gender": speaker.get("gender"),  # 可能是 None
+                    "created_at": created_at,  # 轉換後的時間字串或None
+                    "last_active_at": last_active_at,  # 轉換後的時間字串或None
+                    "meet_count": speaker.get("meet_count"),  # 可能是 None
+                    "meet_days": speaker.get("meet_days"),  # 可能是 None
+                    "voiceprint_ids": voiceprint_ids_str,  # UUID 陣列轉字串陣列
+                    "first_audio": speaker.get("first_audio")  # 可能是 None
+                }
+                
+                api_speakers.append(api_speaker)
+            
+            logger.info(f"成功列出 {len(api_speakers)} 位語者")
+            return api_speakers
+            
+        except Exception as e:
+            logger.error(f"列出語者發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def delete_speaker(self, speaker_id: str) -> Dict[str, Any]:
+        """
+        刪除語者及其所有聲紋的業務邏輯
+        
+        Args:
+            speaker_id: 語者的唯一識別碼
+            
+        Returns:
+            Dict[str, Any]: 包含操作結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 驗證輸入參數
+            if not speaker_id.strip():
+                raise HTTPException(status_code=400, detail="語者ID不能為空")
+
+            # 2. 檢查語者是否存在
+            obj = self.speaker_manager.get_speaker(speaker_id)
+            if not obj:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"找不到ID為 {speaker_id} 的語者"
+                )
+            
+            # 3. 獲取語者資訊用於回傳
+            speaker_name = obj.properties.get('full_name', '未命名')  # V2: 使用 full_name
+            voiceprint_count = len(obj.properties.get('voiceprint_ids', []))
+            
+            # 4. 執行刪除操作
+            success = self.speaker_manager.delete_speaker(speaker_id)
+            
+            if success:
+                logger.info(f"成功刪除語者 {speaker_id} (名稱: {speaker_name}) 及其 {voiceprint_count} 個聲紋")
+                return {
+                    "success": True,
+                    "message": f"成功刪除語者 '{speaker_name}' 及其 {voiceprint_count} 個聲紋",
+                    "data": {
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker_name,
+                        "deleted_voiceprint_count": voiceprint_count
+                    }
+                }
+            else:
+                logger.error(f"刪除操作失敗：speaker_id={speaker_id}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="刪除操作失敗，請檢查日誌以獲取詳細資訊"
+                )
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"刪除語者發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def create_speaker_with_voice(
+        self,
+        audio_file_path: str,
+        full_name: Optional[str] = None,
+        nickname: Optional[str] = None,
+        gender: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        手動建立新語者並加入聲紋特徵
+        
+        Args:
+            audio_file_path: 音檔的暫存路徑
+            full_name: 語者全名，若為None則自動生成
+            nickname: 語者暱稱
+            gender: 語者性別
+            
+        Returns:
+            Dict[str, Any]: 包含建立結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 驗證音檔是否存在
+            import os
+            if not os.path.exists(audio_file_path):
+                raise HTTPException(status_code=400, detail="音檔不存在")
+            
+            # 2. 提取聲紋特徵
+            logger.info(f"開始提取音檔聲紋特徵: {audio_file_path}")
+            embedding = self.audio_processor.extract_embedding(audio_file_path)
+            if embedding is None:
+                raise HTTPException(status_code=400, detail="無法從音檔提取聲紋特徵，請確認音檔品質")
+            
+            # 3. 建立新語者
+            logger.info(f"建立新語者: full_name={full_name}, nickname={nickname}, gender={gender}")
+            speaker_uuid = self.database.create_speaker(
+                full_name=full_name,
+                nickname=nickname,
+                gender=gender,
+                first_audio=os.path.basename(audio_file_path)
+            )
+            
+            if not speaker_uuid:
+                raise HTTPException(status_code=500, detail="建立語者失敗")
+            
+            # 4. 建立聲紋記錄
+            logger.info(f"為語者 {speaker_uuid} 建立聲紋記錄")
+            voiceprint_uuid = self.database.create_voiceprint(
+                speaker_uuid=speaker_uuid,
+                embedding=embedding,
+                audio_source=os.path.basename(audio_file_path)
+            )
+            
+            if not voiceprint_uuid:
+                # 如果聲紋建立失敗，回滾語者建立
+                try:
+                    self.database.delete_speaker(speaker_uuid)
+                except Exception:
+                    pass  # 忽略回滾錯誤
+                raise HTTPException(status_code=500, detail="建立聲紋失敗")
+            
+            # 5. 獲取完整的語者資訊
+            speaker_obj = self.database.get_speaker(speaker_uuid)
+            if not speaker_obj:
+                raise HTTPException(status_code=500, detail="無法獲取新建立的語者資訊")
+            
+            props = speaker_obj.properties
+            logger.info(f"成功建立語者 {speaker_uuid} 及聲紋 {voiceprint_uuid}")
+            
+            return {
+                "success": True,
+                "message": f"成功建立語者 '{props.get('full_name')}' 並加入聲紋特徵",
+                "data": {
+                    "speaker_uuid": speaker_uuid,
+                    "speaker_id": props.get('speaker_id'),
+                    "full_name": props.get('full_name'),
+                    "nickname": props.get('nickname'),
+                    "gender": props.get('gender'),
+                    "voiceprint_uuid": voiceprint_uuid,
+                    "voiceprint_count": 1
+                }
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"建立語者時發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"建立語者失敗：{str(e)}"
+            )
+
+    def verify_speaker_voice(
+        self, 
+        audio_file_path: str,
+        threshold: float = 0.39,
+        max_results: int = 3
+    ) -> Dict[str, Any]:
+        """
+        驗證音檔中的語者身份，純讀取操作，不會修改任何資料
+        
+        Args:
+            audio_file_path: 音檔的暫存路徑
+            threshold: 比對閾值，距離小於此值才認為是匹配
+            max_results: 返回最相似的結果數量
+            
+        Returns:
+            Dict[str, Any]: 包含識別結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            logger.info(f"開始驗證音檔: {audio_file_path}")
+            
+            # 1. 從音檔提取語音特徵向量
+            try:
+                embedding = self.audio_processor.extract_embedding(audio_file_path)
+                logger.debug(f"成功提取語音特徵向量，維度: {embedding.shape}")
+            except Exception as e:
+                logger.error(f"提取語音特徵失敗: {str(e)}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"音檔處理失敗：{str(e)}"
+                )
+            
+            # 2. 與資料庫中的聲紋進行比對（純讀取操作）
+            try:
+                best_id, best_name, best_distance, all_distances = self.database.find_similar_voiceprints(
+                    embedding=embedding,
+                    limit=max_results
+                )
+                logger.debug(f"比對完成，找到 {len(all_distances)} 個候選結果")
+            except Exception as e:
+                logger.error(f"聲紋比對失敗: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"聲紋比對失敗：{str(e)}"
+                )
+            
+            # 3. 處理比對結果
+            if not all_distances:
+                logger.info("資料庫中沒有任何聲紋資料")
+                return {
+                    "success": True,
+                    "message": "資料庫中沒有任何聲紋資料",
+                    "is_known_speaker": False,
+                    "best_match": None,
+                    "all_candidates": [],
+                    "threshold": threshold,
+                    "total_candidates": 0
+                }
+            
+            # 4. 判斷是否為已知語者
+            is_known_speaker = best_distance < threshold
+            
+            # 5. 準備返回的候選結果
+            candidates = []
+            for voice_id, speaker_name, distance, update_count in all_distances:
+                candidates.append({
+                    "voiceprint_uuid": str(voice_id),  # 更新欄位名稱
+                    "speaker_name": speaker_name,
+                    "distance": float(distance),
+                    "update_count": update_count,
+                    "is_match": distance < threshold
+                })
+            
+            # 6. 準備最佳匹配結果
+            best_match = None
+            if best_id and best_name:
+                best_match = {
+                    "voiceprint_uuid": str(best_id),  # 更新欄位名稱
+                    "speaker_name": best_name,
+                    "distance": float(best_distance),
+                    "is_match": is_known_speaker
+                }
+            
+            # 7. 記錄驗證結果
+            if is_known_speaker:
+                logger.info(f"驗證成功 - 識別為語者: {best_name}, 距離: {best_distance:.4f}")
+            else:
+                logger.info(f"驗證結果 - 未知語者, 最相似語者: {best_name if best_name else '無'}, 距離: {best_distance:.4f}")
+            
+            return {
+                "success": True,
+                "message": "語音驗證完成" if is_known_speaker else "未找到匹配的語者",
+                "is_known_speaker": is_known_speaker,
+                "best_match": best_match,
+                "all_candidates": candidates,
+                "threshold": threshold,
+                "total_candidates": len(candidates)
+            }
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"語音驗證過程發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def update_speaker(self, speaker_id: str, update_fields: dict) -> dict:
+        """
+        通用語者資料更新（僅允許部分欄位可更新）
+        Args:
+            speaker_id: 語者唯一識別碼（UUID 或序號ID）
+            update_fields: 欲更新的欄位 dict
+        Returns:
+            dict: 操作結果
+        Raises:
+            HTTPException: 當操作失敗時
+        """
+        try:
+            # 1. 驗證輸入
+            if not speaker_id or not update_fields:
+                raise HTTPException(status_code=400, detail="語者ID與更新欄位不可為空")
+            # 2. 檢查語者是否存在
+            obj = self.speaker_manager.get_speaker(speaker_id)
+            if not obj:
+                raise HTTPException(status_code=404, detail=f"找不到ID為 {speaker_id} 的語者")
+            # 3. 執行更新
+            success = self.speaker_manager.update_speaker(speaker_id, update_fields)
+            if success:
+                logger.info(f"成功更新語者 {speaker_id} 欄位: {list(update_fields.keys())}")
+                return {
+                    "success": True,
+                    "message": f"成功更新語者 {speaker_id} 欄位: {list(update_fields.keys())}",
+                    "data": {"speaker_id": speaker_id, "updated_fields": update_fields}
+                }
+            else:
+                logger.error(f"語者更新失敗：speaker_id={speaker_id}")
+                raise HTTPException(status_code=500, detail="語者更新失敗，請檢查日誌以獲取詳細資訊")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"語者更新發生未預期錯誤：{str(e)}")
+            raise HTTPException(status_code=500, detail=f"伺服器內部錯誤：{str(e)}")
+
+    # ------------------------- Session CRUD -------------------------
+    def create_session(self, request: Any) -> dict:
+        """
+        新增 Session 紀錄
+        Args:
+            request: SessionCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.create_session(request)
+        except Exception as e:
+            logger.error(f"建立 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def list_sessions(self) -> list:
+        """
+        列出所有 Session
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            return self.session_manager.list_sessions()
+        except Exception as e:
+            logger.error(f"列出 Session 發生錯誤: {e}")
+            return []
+
+    def get_session_info(self, session_id: str) -> dict:
+        """
+        取得單一 Session 資訊
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: SessionInfo
+        """
+        try:
+            return self.session_manager.get_session_info(session_id)
+        except Exception as e:
+            logger.error(f"查詢 Session 發生錯誤: {e}")
+            return {}
+
+    def update_session(self, session_id: str, update_fields: dict) -> dict:
+        """
+        部分更新 Session
+        Args:
+            session_id: Session UUID
+            update_fields: 欲更新欄位 dict
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.update_session(session_id, update_fields)
+        except Exception as e:
+            logger.error(f"更新 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def delete_session(self, session_id: str) -> dict:
+        """
+        刪除 Session
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.delete_session(session_id)
+        except Exception as e:
+            logger.error(f"刪除 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # ------------------------- SpeechLog CRUD -------------------------
+    def create_speechlog(self, request: Any) -> dict:
+        """
+        新增 SpeechLog 紀錄，並自動更新對應 Session 的時間範圍
+        Args:
+            request: SpeechLogCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            # 1. 建立 SpeechLog
+            result = self.speechlog_manager.create_speechlog(request)
+            
+            # 2. 如果建立成功且有關聯的 Session，自動更新 Session 時間範圍
+            if result.get("success") and hasattr(request, 'session') and request.session:
+                try:
+                    self._update_session_timerange(request.session)
+                except Exception as e:
+                    logger.warning(f"更新 Session {request.session} 時間範圍失敗: {e}")
+                    # 不影響 SpeechLog 建立的成功結果
+            
+            return result
+        except Exception as e:
+            logger.error(f"建立 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def list_speechlogs(self) -> list:
+        """
+        列出所有 SpeechLog
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.list_speechlogs()
+        except Exception as e:
+            logger.error(f"列出 SpeechLog 發生錯誤: {e}")
+            return []
+
+    def get_speechlog_info(self, speechlog_id: str) -> dict:
+        """
+        取得單一 SpeechLog 資訊
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: SpeechLogInfo
+        """
+        try:
+            return self.speechlog_manager.get_speechlog_info(speechlog_id)
+        except Exception as e:
+            logger.error(f"查詢 SpeechLog 發生錯誤: {e}")
+            return {}
+
+    def update_speechlog(self, speechlog_id: str, update_fields: dict) -> dict:
+        """
+        部分更新 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+            update_fields: 欲更新欄位 dict
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.speechlog_manager.update_speechlog(speechlog_id, update_fields)
+        except Exception as e:
+            logger.error(f"更新 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def delete_speechlog(self, speechlog_id: str) -> dict:
+        """
+        刪除 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.speechlog_manager.delete_speechlog(speechlog_id)
+        except Exception as e:
+            logger.error(f"刪除 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # ------------------------- 關聯查詢方法 -------------------------
+    def get_speaker_sessions(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 Session 列表
+        Args:
+            speaker_id: 語者 UUID
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            return self.session_manager.get_sessions_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 Session 發生錯誤: {e}")
+            return []
+
+    def get_speaker_speechlogs(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 SpeechLog 列表
+        Args:
+            speaker_id: 語者 UUID
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.get_speechlogs_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 SpeechLog 發生錯誤: {e}")
+            return []
+
+    def get_session_speechlogs(self, session_id: str) -> list:
+        """
+        透過 Session 取得相關的 SpeechLog 列表
+        Args:
+            session_id: Session UUID
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.get_speechlogs_by_session(session_id)
+        except Exception as e:
+            logger.error(f"查詢 Session 的 SpeechLog 發生錯誤: {e}")
+            return []
+
+    # ------------------------- Session 時間範圍自動計算 -------------------------
+    def _update_session_timerange(self, session_id: str) -> None:
+        """
+        根據關聯的 SpeechLog 自動更新 Session 的時間範圍
+        Args:
+            session_id: Session UUID
+        """
+        try:
+            # 1. 取得 Session 相關的所有 SpeechLog
+            speechlogs = self.get_session_speechlogs(session_id)
+            
+            if not speechlogs:
+                logger.info(f"Session {session_id} 尚無 SpeechLog，跳過時間範圍更新")
+                return
+            
+            # 2. 計算時間範圍
+            timestamps = []
+            durations = []
+            
+            for log in speechlogs:
+                if log.get('timestamp'):
+                    timestamps.append(log['timestamp'])
+                    # 計算結束時間（開始時間 + 持續時間）
+                    if log.get('duration'):
+                        try:
+                            from datetime import datetime, timedelta, timezone
+                            # 處理不同的時間格式
+                            timestamp_str = log['timestamp']
+                            
+                            # 解析時間戳並確保時區一致性
+                            if timestamp_str.endswith('Z') or timestamp_str.endswith('+00:00'):
+                                # UTC 格式，轉換為台北時間
+                                if timestamp_str.endswith('Z'):
+                                    utc_time = datetime.fromisoformat(timestamp_str[:-1] + '+00:00')
+                                else:
+                                    utc_time = datetime.fromisoformat(timestamp_str)
+                                taipei_tz = timezone(timedelta(hours=8))
+                                start_time = utc_time.astimezone(taipei_tz)
+                            else:
+                                start_time = datetime.fromisoformat(timestamp_str)
+                                # 如果沒有時區資訊，假設為台北時間
+                                if start_time.tzinfo is None:
+                                    taipei_tz = timezone(timedelta(hours=8))
+                                    start_time = start_time.replace(tzinfo=taipei_tz)
+                            
+                            end_time = start_time + timedelta(seconds=float(log['duration']))
+                            
+                            # 使用 format_rfc3339 確保正確格式
+                            from modules.database.database import format_rfc3339
+                            durations.append(format_rfc3339(end_time))
+                        except Exception as e:
+                            logger.warning(f"計算 SpeechLog 結束時間失敗: {e}")
+                            # 如果計算失敗，使用原始時間戳
+                            durations.append(log['timestamp'])
+            
+            if not timestamps:
+                logger.warning(f"Session {session_id} 的 SpeechLog 都沒有有效的時間戳，跳過更新")
+                return
+            
+            # 3. 找出最早和最晚時間，並確保格式一致
+            # 將所有時間戳轉換為 datetime 物件進行比較
+            parsed_timestamps = []
+            parsed_durations = []
+            
+            # 解析開始時間，確保所有時間都轉換為台北時間
+            for ts in timestamps:
+                try:
+                    if ts.endswith('Z') or ts.endswith('+00:00'):
+                        # UTC 格式，轉換為台北時間
+                        if ts.endswith('Z'):
+                            utc_time = datetime.fromisoformat(ts[:-1] + '+00:00')
+                        else:
+                            utc_time = datetime.fromisoformat(ts)
+                        taipei_tz = timezone(timedelta(hours=8))
+                        dt = utc_time.astimezone(taipei_tz)
+                    else:
+                        dt = datetime.fromisoformat(ts)
+                        if dt.tzinfo is None:
+                            taipei_tz = timezone(timedelta(hours=8))
+                            dt = dt.replace(tzinfo=taipei_tz)
+                    parsed_timestamps.append(dt)
+                except Exception as e:
+                    logger.warning(f"解析時間戳失敗: {ts}, 錯誤: {e}")
+            
+            # 解析結束時間，確保所有時間都轉換為台北時間
+            for ts in durations:
+                try:
+                    if ts.endswith('Z') or ts.endswith('+00:00'):
+                        # UTC 格式，轉換為台北時間
+                        if ts.endswith('Z'):
+                            utc_time = datetime.fromisoformat(ts[:-1] + '+00:00')
+                        else:
+                            utc_time = datetime.fromisoformat(ts)
+                        taipei_tz = timezone(timedelta(hours=8))
+                        dt = utc_time.astimezone(taipei_tz)
+                    else:
+                        dt = datetime.fromisoformat(ts)
+                        if dt.tzinfo is None:
+                            taipei_tz = timezone(timedelta(hours=8))
+                            dt = dt.replace(tzinfo=taipei_tz)
+                    parsed_durations.append(dt)
+                except Exception as e:
+                    logger.warning(f"解析時間戳失敗: {ts}, 錯誤: {e}")
+            
+            if not parsed_timestamps:
+                logger.warning(f"Session {session_id} 沒有有效的時間戳，跳過更新")
+                return
+            
+            # 找出最早和最晚時間
+            earliest_time = min(parsed_timestamps)
+            latest_time = max(parsed_durations) if parsed_durations else max(parsed_timestamps)
+            
+            # 使用 format_rfc3339 確保正確格式
+            from modules.database.database import format_rfc3339
+            start_time_str = format_rfc3339(earliest_time)
+            end_time_str = format_rfc3339(latest_time)
+            
+            # 4. 更新 Session
+            update_fields = {
+                "start_time": start_time_str,
+                "end_time": end_time_str
+            }
+            
+            result = self.update_session(session_id, update_fields)
+            if result.get("success"):
+                logger.info(f"Session {session_id} 時間範圍已更新: {start_time_str} ~ {end_time_str}")
+            else:
+                logger.error(f"更新 Session {session_id} 時間範圍失敗: {result.get('message')}")
+                
+        except Exception as e:
+            logger.error(f"更新 Session {session_id} 時間範圍時發生錯誤: {e}")
+            raise
+    
+    def recalculate_session_timerange(self, session_id: str) -> dict:
+        """
+        手動重新計算 Session 的時間範圍（公開方法，供 API 調用）
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            self._update_session_timerange(session_id)
+            return {"success": True, "message": "Session 時間範圍重新計算完成", "data": None}
+        except Exception as e:
+            logger.error(f"重新計算 Session {session_id} 時間範圍失敗: {e}")
+            return {"success": False, "message": str(e), "data": None}
