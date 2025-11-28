@@ -115,6 +115,7 @@ npm run build
 2.  複製範例設定檔：
     ```bash
     cp .env.example .env
+    # Windows 使用者請用: copy .env.example .env
     ```
 3.  編輯 `.env` 檔案，填入您的 OpenAI API Key：
     ```ini

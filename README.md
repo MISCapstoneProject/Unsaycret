@@ -54,6 +54,7 @@ Unsaycret 是一個整合語音轉錄、聲紋識別與語意分析的綜合平�
    複製範例設定檔並依需求修改：
    ```bash
    cp .env.example .env
+   # Windows 使用者請用: copy .env.example .env
    ```
 
 5. **啟動 Docker 服務 (Weaviate)**
@@ -72,7 +73,9 @@ Unsaycret 是一個整合語音轉錄、聲紋識別與語意分析的綜合平�
 本系統內建 AI 智慧助手功能（摘要、問答）。**此步驟為可選**，若不需要 AI 功能可直接跳過，不影響其他功能運作。
 
 1.  進入前端目錄 `Unsaycret-Web`。
-2.  複製範例設定檔：`cp .env.example .env`
+2.  複製範例設定檔：
+    *   Mac/Linux: `cp .env.example .env`
+    *   Windows: `copy .env.example .env`
 3.  編輯 `.env` 檔案，填入您的 API Key：
     ```ini
     VITE_OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -89,7 +92,6 @@ Unsaycret 是一個整合語音轉錄、聲紋識別與語意分析的綜合平�
 2.  **安裝依賴套件**
     ```bash
     npm install
-    ```
 
 3.  **啟動開發伺服器**
     ```bash
@@ -155,4 +157,4 @@ A: 請確認 Docker Desktop 是否已開啟，且連接埠 8080 未被佔用。
 
 ---
 **源代碼提交版本**
-最後更新日期: 2025-11-27
+最後更新日期: 2025-11-28

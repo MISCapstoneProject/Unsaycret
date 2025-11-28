@@ -10,8 +10,6 @@ unsaycret_venv/
 # Node.js
 node_modules/
 .pnpm/
-yarn.lock
-package-lock.json
 dist/
 dist-ssr/
 build/
@@ -41,6 +39,7 @@ output_log.txt
 
 # IDEs
 .vscode/
+.github/copilot-instructions.md
 .idea/
 *.suo
 *.ntvs*
@@ -72,7 +71,6 @@ outputs/
 
 # Tests
 *test_report.json
-*.json
 coverage/
 *.lcov
 jest-html-reporters-*.html
