@@ -1,23 +1,23 @@
 services:
   weaviate:
     command:
-    - --host
-    - 0.0.0.0
-    - --port
-    - '8080'
-    - --scheme
-    - http
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --scheme
+      - http
     image: cr.weaviate.io/semitechnologies/weaviate:1.30.0
     ports:
-    - 8080:8080
-    - 50051:50051
+      - 8080:8080
+      - 50051:50051
     volumes:
-    - weaviate_data:/var/lib/weaviate
-    - weaviate_backups:/var/lib/weaviate/backups
+      - weaviate_data:/var/lib/weaviate
+      - weaviate_backups:/var/lib/weaviate/backups
     restart: unless-stopped
-    healthcheck:          
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/v1/.well-known/ready || exit 1"]
-      interval: 30s       
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/v1/.well-known/ready || exit 1" ]
+      interval: 30s
       timeout: 5s
       retries: 3
     environment:
@@ -28,6 +28,8 @@ services:
       ENABLE_MODULES: 'backup-filesystem'
       BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backups'
       CLUSTER_HOSTNAME: 'node1'
+      DISK_USE_WARNING_PERCENTAGE: 90
+      DISK_USE_READONLY_PERCENTAGE: 95
 
   weaviate_console:
     image: semitechnologies/weaviate-console:latest
